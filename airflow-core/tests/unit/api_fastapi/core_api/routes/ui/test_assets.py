@@ -222,3 +222,49 @@ class TestNextRunAssets:
         assert resp.status_code == 200
         ev = resp.json()["events"][0]
         assert (ev["lastUpdate"] is not None) == expect_last_update
+
+    def test_queued_asset_shown_when_dag_has_never_run(self, test_client, dag_maker, session):
+        """
+        Regression test for https://github.com/apache/airflow/issues/64616
+
+        When a consumer DAG has never run (first-ever run scenario), assets that have been
+        queued (have an ADRQ record) should still show a non-null lastUpdate. Previously,
+        the frontend used ``latestRunAfter`` to filter events, which was undefined for a
+        first-ever run and caused the counter to always show 0 of N.
+        """
+        with dag_maker(
+            dag_id="first_run_consumer",
+            schedule=[
+                Asset(uri="s3://bucket/X", name="X"),
+                Asset(uri="s3://bucket/Y", name="Y"),
+            ],
+            serialized=True,
+        ):
+            EmptyOperator(task_id="t")
+
+        # Do NOT create a dagrun — simulates the first-ever run scenario.
+        dag_maker.sync_dagbag_to_db()
+
+        assets = {
+            a.uri: a
+            for a in session.scalars(
+                select(AssetModel).where(AssetModel.uri.in_(["s3://bucket/X", "s3://bucket/Y"]))
+            )
+        }
+        # Only asset X is queued (producer_X ran, producer_Y has not).
+        session.add(AssetDagRunQueue(asset_id=assets["s3://bucket/X"].id, target_dag_id="first_run_consumer"))
+        session.add(AssetEvent(asset_id=assets["s3://bucket/X"].id, timestamp=pendulum.now()))
+        session.commit()
+
+        resp = test_client.get("/next_run_assets/first_run_consumer")
+        assert resp.status_code == 200
+        events = {e["uri"]: e for e in resp.json()["events"]}
+
+        # X was produced and is queued → lastUpdate should be set.
+        assert events["s3://bucket/X"]["lastUpdate"] is not None, (
+            "Asset X is in the queue but lastUpdate is None on first-ever run"
+        )
+        # Y was not produced → lastUpdate should be None.
+        assert events["s3://bucket/Y"]["lastUpdate"] is None, (
+            "Asset Y is not in the queue but lastUpdate is not None"
+        )

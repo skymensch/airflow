@@ -1,0 +1,1 @@
+Add regression test for asset counter not updating on first-ever DAG run (#64616)
